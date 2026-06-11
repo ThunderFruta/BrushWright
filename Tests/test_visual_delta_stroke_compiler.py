@@ -36,6 +36,7 @@ def _write_sample(
     split_root: Path,
     sample_id: str = "sample_a",
     finishing_strokes: list[dict] | None = None,
+    visual_teacher_strokes: list[dict] | None = None,
     structure_target: bool = False,
     target_contract: str | None = None,
 ) -> None:
@@ -57,6 +58,22 @@ def _write_sample(
     if target_contract is not None:
         sample["target_contract"] = target_contract
         split_manifest["target_contract"] = target_contract
+    if visual_teacher_strokes is not None:
+        sample["visual_teacher_strokes"] = "visual_teacher_strokes.json"
+        sample["visual_teacher_manifest"] = "visual_teacher_manifest.json"
+        sample["target_strokes_source"] = "greedy_stroke_optimizer_v1"
+        _write_json(
+            sample_dir / "visual_teacher_strokes.json",
+            _program(visual_teacher_strokes),
+        )
+        _write_json(
+            sample_dir / "visual_teacher_manifest.json",
+            {
+                "version": 1,
+                "teacher_source": "greedy_stroke_optimizer_v1",
+                "teacher_stroke_count": len(visual_teacher_strokes),
+            },
+        )
     if structure_target:
         sample["target_selection_mode"] = "structure_first_v1"
         sample["target_selection_manifest"] = "target_selection_manifest.json"
@@ -153,6 +170,26 @@ class VisualDeltaStrokeCompilerTest(unittest.TestCase):
 
             self.assertEqual(item.patch_tensor.shape, (10, 64, 64))
             self.assertLessEqual(int(item.target_present.sum().item()), 256)
+
+    def test_dataset_prefers_visual_teacher_strokes_when_available(self) -> None:
+        from Source.Model import VisualDeltaStrokeDataset
+
+        with tempfile.TemporaryDirectory() as root_name:
+            split_root = Path(root_name) / "Train"
+            split_root.mkdir()
+            _write_sample(
+                split_root,
+                finishing_strokes=[_stroke(0.8, 0.8)],
+                visual_teacher_strokes=[_stroke(0.2, 0.2)],
+            )
+            _write_manifest(split_root, ["sample_a"])
+
+            dataset = VisualDeltaStrokeDataset(split_root, patch_size=256, patch_stride=256, negative_patch_ratio=0.0)
+            item = dataset[0]
+
+            self.assertEqual(int(item.target_present.sum().item()), 1)
+            self.assertAlmostEqual(float(item.target_numeric[0, 0].item()), 0.4, places=3)
+            self.assertAlmostEqual(float(item.target_numeric[0, 1].item()), 0.4, places=3)
 
     def test_patch_numeric_round_trips_to_global_stroke(self) -> None:
         from Source.Model import patch_numeric_to_global_stroke

@@ -70,7 +70,7 @@ class _CachedVisualDeltaSample:
     target_image: torch.Tensor
     error_map: torch.Tensor
     edit_mask: torch.Tensor
-    finishing_strokes: list[dict[str, Any]]
+    target_strokes: list[dict[str, Any]]
 
 
 class VisualDeltaStrokeDataset(Dataset):
@@ -135,7 +135,7 @@ class VisualDeltaStrokeDataset(Dataset):
         mask_patch = sample.edit_mask[:, top:bottom, left:right]
         patch_tensor = torch.cat([draft_patch, target_patch, error_patch, mask_patch], dim=0)
         target_numeric, target_brush_ids, target_present, target_padding_mask = self._target_tensors(
-            sample.finishing_strokes,
+            sample.target_strokes,
             left=left,
             top=top,
             patch_size=patch.patch_size,
@@ -166,8 +166,8 @@ class VisualDeltaStrokeDataset(Dataset):
             self._validate_structure_target_sample(sample_dir, sample)
             draft_image = load_draft_image_tensor(sample_dir / sample["draft_image"])
             target_image = load_draft_image_tensor(_target_image_path(sample_dir, sample))
-            finishing_program = _read_json(sample_dir / sample["finishing_strokes"])
-            finishing_strokes = finishing_program["strokes"]
+            target_program = _read_json(_target_strokes_path(sample_dir, sample))
+            target_strokes = target_program["strokes"]
             error_map = torch.abs(target_image - draft_image)
             edit_mask = _build_edit_mask(error_map, self.mask_threshold)
             edge_map = _build_structure_edge_map(error_map)
@@ -181,7 +181,7 @@ class VisualDeltaStrokeDataset(Dataset):
                     is_changed = int(mask_patch.sum().item()) >= self.min_changed_pixels
                     target_stroke_count = sum(
                         1
-                        for stroke in finishing_strokes
+                        for stroke in target_strokes
                         if _stroke_inside_patch(stroke, left=left, top=top, patch_size=self.patch_size)
                     )
                     edge_density = float((edge_patch * mask_patch).mean().item())
@@ -227,13 +227,13 @@ class VisualDeltaStrokeDataset(Dataset):
         target_image = load_draft_image_tensor(_target_image_path(sample_dir, sample))
         error_map = torch.abs(target_image - draft_image)
         edit_mask = _build_edit_mask(error_map, self.mask_threshold)
-        finishing_program = _read_json(sample_dir / sample["finishing_strokes"])
+        target_program = _read_json(_target_strokes_path(sample_dir, sample))
         cached = _CachedVisualDeltaSample(
             draft_image=draft_image,
             target_image=target_image,
             error_map=error_map,
             edit_mask=edit_mask,
-            finishing_strokes=finishing_program["strokes"],
+            target_strokes=target_program["strokes"],
         )
         if self.cache_samples:
             self._sample_cache[sample_dir] = cached
@@ -419,3 +419,13 @@ def _target_image_path(sample_dir: Path, sample: dict[str, Any]) -> Path:
     if not image_name:
         raise ValueError(f"{sample_dir} sample is missing target_image metadata")
     return sample_dir / str(image_name)
+
+
+def _target_strokes_path(sample_dir: Path, sample: dict[str, Any]) -> Path:
+    strokes_name = sample.get("visual_teacher_strokes") or sample.get("finishing_strokes")
+    if not strokes_name:
+        raise ValueError(f"{sample_dir} sample is missing finishing_strokes metadata")
+    path = sample_dir / str(strokes_name)
+    if not path.exists():
+        raise ValueError(f"{sample_dir} target stroke program does not exist: {path}")
+    return path
