@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "canvas": {
+    "width": 512,
+    "height": 512
+  },
+  "metadata": {
+    "sample_id": "sample_stroke_program",
+    "seed": 1,
+    "description": "Tiny deterministic renderer smoke fixture"
+  },
+  "strokes": [
+    {
+      "x": 0.50,
+      "y": 0.76,
+      "angle": 0.94,
+      "length": 0.55,
+      "width": 0.045,
+      "color": [0.86, 0.12, 0.08],
+      "opacity": 0.95,
+      "brush": "flat_oil"
+    },
+    {
+      "x": 0.54,
+      "y": 0.33,
+      "angle": 0.08,
+      "length": 0.68,
+      "width": 0.032,
+      "color": [0.10, 0.46, 0.92],
+      "opacity": 0.88,
+      "brush": "flat_oil"
+    },
+    {
+      "x": 0.50,
+      "y": 0.51,
+      "angle": 0.00,
+      "length": 0.40,
+      "width": 0.024,
+      "color": [0.95, 0.72, 0.18],
+      "opacity": 0.82,
+      "brush": "flat_oil"
+    }
+  ]
+}
+

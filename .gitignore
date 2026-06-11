@@ -1,0 +1,24 @@
+# Generated local outputs
+Outputs/*
+!Outputs/README.md
+Data/Train/
+Data/Val/
+Data/Test/
+Models/Checkpoints/
+*.log
+
+# Python caches
+**/__pycache__/
+*.py[cod]
+.venv/
+.vscode/
+
+# Local real-world media can be large or private.
+Assets/drafts/
+Assets/ImageCorpus/*
+!Assets/ImageCorpus/README.md
+Assets/references/
+Assets/notes/
+
+# Local Paint Transformer checkpoints are large external artifacts.
+ThirdParty/PaintTransformer/*.pth
