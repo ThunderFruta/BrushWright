@@ -80,6 +80,7 @@ class VisualDeltaTrainingConfig:
     min_changed_pixels: int = 16
     negative_patch_ratio: float = 0.25
     edge_focused_sampling: bool = True
+    include_zero_target_changed_patches: bool = True
     overfit_patches: int = 0
     overfit_samples: int = 0
     train_repeat_factor: int = 1
@@ -109,6 +110,7 @@ class VisualDeltaTrainingConfig:
     min_visual_gradient_improvement: float = 0.0
     min_visual_edge_overlap: float = 0.02
     present_threshold: float = DEFAULT_PRESENT_THRESHOLD
+    min_export_candidates_per_sample: int = 0
     max_export_strokes_per_sample: int = DEFAULT_MAX_STROKES
     max_export_strokes_per_patch: int = DEFAULT_MAX_STROKES
     min_export_render_area: float = 8.0
@@ -117,6 +119,7 @@ class VisualDeltaTrainingConfig:
     seed: int = 20260603
     log_every: int = 10
     cuda_attention_backend: str = DEFAULT_CUDA_ATTENTION_BACKEND
+    early_stop_zero_selected_epochs: int = 3
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -144,6 +147,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         min_changed_pixels=args.min_changed_pixels,
         negative_patch_ratio=args.negative_patch_ratio,
         edge_focused_sampling=not args.no_edge_focused_sampling,
+        include_zero_target_changed_patches=args.include_zero_target_changed_patches,
         overfit_patches=args.overfit_patches,
         overfit_samples=args.overfit_samples,
         train_repeat_factor=args.train_repeat_factor,
@@ -173,6 +177,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         min_visual_gradient_improvement=args.min_visual_gradient_improvement,
         min_visual_edge_overlap=args.min_visual_edge_overlap,
         present_threshold=args.present_threshold,
+        min_export_candidates_per_sample=args.min_export_candidates_per_sample,
         max_export_strokes_per_sample=args.max_export_strokes_per_sample,
         max_export_strokes_per_patch=args.max_export_strokes_per_patch,
         min_export_render_area=args.min_export_render_area,
@@ -181,6 +186,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         seed=args.seed,
         log_every=args.log_every,
         cuda_attention_backend=args.cuda_attention_backend,
+        early_stop_zero_selected_epochs=args.early_stop_zero_selected_epochs,
     )
     train_visual_delta_strokes(config)
     return 0
@@ -203,6 +209,10 @@ def train_visual_delta_strokes(config: VisualDeltaTrainingConfig) -> dict[str, A
     print(f"  target VRAM class: ~{config.target_vram_gb}GB", flush=True)
     print(
         f"  patches: size={config.patch_size} stride={config.patch_stride} max_strokes={config.max_strokes_per_patch}",
+        flush=True,
+    )
+    print(
+        f"  patch filtering: include_zero_target_changed_patches={config.include_zero_target_changed_patches}",
         flush=True,
     )
     print(
@@ -310,7 +320,9 @@ def train_visual_delta_strokes(config: VisualDeltaTrainingConfig) -> dict[str, A
             _write_json(config.output_dir / "visual_metrics.json", _visual_metrics_log(metrics))
             print(
                 f"  visual validation: improvement_rate={visual_metrics['visual_improvement_rate']:.3f} "
-                f"low_change_rate={visual_metrics['low_change_rate']:.3f}",
+                f"low_change_rate={visual_metrics['low_change_rate']:.3f} "
+                f"selected_count={visual_metrics['selected_count']:.0f} "
+                f"max_present={visual_metrics['max_present']:.6f}",
                 flush=True,
             )
         is_better, best_val_loss, best_visual_improvement_rate = _is_better_visual_delta_checkpoint(
@@ -336,6 +348,12 @@ def train_visual_delta_strokes(config: VisualDeltaTrainingConfig) -> dict[str, A
             print(f"  wrote {config.output_dir / 'best.pt'}", flush=True)
         _write_json(config.output_dir / "metrics.json", metrics)
         print(f"  wrote {config.output_dir / 'metrics.json'}", flush=True)
+        if _should_early_stop_zero_selected(config, visual_metrics, epoch):
+            print(
+                f"  early stop: selected_count stayed zero through epoch {epoch}",
+                flush=True,
+            )
+            break
 
     return {
         "epochs": metrics,
@@ -356,6 +374,7 @@ def _build_dataset(config: VisualDeltaTrainingConfig, split: str) -> VisualDelta
         min_changed_pixels=config.min_changed_pixels,
         negative_patch_ratio=config.negative_patch_ratio,
         edge_focused_sampling=config.edge_focused_sampling,
+        include_zero_target_changed_patches=config.include_zero_target_changed_patches,
         require_structure_targets=config.require_structure_targets,
         require_target_contract=config.require_target_contract,
     )
@@ -535,6 +554,7 @@ def _save_checkpoint(
                 "min_changed_pixels": dataset_config.min_changed_pixels,
                 "negative_patch_ratio": dataset_config.negative_patch_ratio,
                 "edge_focused_sampling": dataset_config.edge_focused_sampling,
+                "include_zero_target_changed_patches": dataset_config.include_zero_target_changed_patches,
                 "count_weight": dataset_config.count_weight,
                 "image_weight": dataset_config.image_weight,
                 "preservation_weight": dataset_config.preservation_weight,
@@ -549,6 +569,7 @@ def _save_checkpoint(
                 "slot_aware_targets": dataset_config.slot_aware_targets,
                 "training_renderer": dataset_config.training_renderer,
                 "present_threshold": dataset_config.present_threshold,
+                "min_export_candidates_per_sample": dataset_config.min_export_candidates_per_sample,
                 "present_positive_weight": dataset_config.present_positive_weight,
                 "max_export_strokes_per_sample": dataset_config.max_export_strokes_per_sample,
                 "max_export_strokes_per_patch": dataset_config.max_export_strokes_per_patch,
@@ -557,6 +578,7 @@ def _save_checkpoint(
                 "target_vram_gb": dataset_config.target_vram_gb,
                 "require_structure_targets": dataset_config.require_structure_targets,
                 "require_target_contract": dataset_config.require_target_contract,
+                "early_stop_zero_selected_epochs": dataset_config.early_stop_zero_selected_epochs,
             },
             "checkpoint_type": checkpoint_type,
             "tokenizer": {
@@ -592,6 +614,7 @@ def _run_visual_validation(config: VisualDeltaTrainingConfig, epoch: int) -> dic
             min_gradient_improvement=config.min_visual_gradient_improvement,
             min_edge_overlap=config.min_visual_edge_overlap,
             present_threshold=config.present_threshold,
+            min_export_candidates_per_sample=config.min_export_candidates_per_sample,
             max_strokes_per_sample=config.max_export_strokes_per_sample,
             max_strokes_per_patch=config.max_export_strokes_per_patch,
             min_render_area=config.min_export_render_area,
@@ -604,6 +627,7 @@ def _run_visual_validation(config: VisualDeltaTrainingConfig, epoch: int) -> dic
     low_change = [entry for entry in rendered if entry.get("status") == "failed_low_pixel_change"]
     structure_failed = [entry for entry in rendered if entry.get("status") == "failed_structure_noise"]
     structure_metrics = _average_structure_metrics(rendered)
+    export_filter_metrics = _average_export_filter_metrics(exported)
     visual_pass = bool(improved) and not low_change and not structure_failed
     summary = {
         "epoch": epoch,
@@ -618,6 +642,7 @@ def _run_visual_validation(config: VisualDeltaTrainingConfig, epoch: int) -> dic
         "structure_failed_count": len(structure_failed),
         "structure_failed_rate": len(structure_failed) / len(rendered) if rendered else 0.0,
         **structure_metrics,
+        **export_filter_metrics,
         "checkpoint_status": "visual_pass" if visual_pass else "visual_failed",
         "status_histogram": _status_histogram(exported),
     }
@@ -702,6 +727,10 @@ def _validate_config(config: VisualDeltaTrainingConfig) -> None:
         raise ValueError("max_export_strokes_per_patch must be positive")
     if config.min_export_render_area < 0.0:
         raise ValueError("min_export_render_area must be non-negative")
+    if config.min_export_candidates_per_sample < 0:
+        raise ValueError("min_export_candidates_per_sample must be non-negative")
+    if config.early_stop_zero_selected_epochs < 0:
+        raise ValueError("early_stop_zero_selected_epochs must be non-negative")
     if config.export_ranking_mode != "visual-delta":
         raise ValueError("export_ranking_mode must be 'visual-delta'")
     if config.target_vram_gb <= 0:
@@ -734,6 +763,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-changed-pixels", type=int, default=16)
     parser.add_argument("--negative-patch-ratio", type=float, default=0.25)
     parser.add_argument("--no-edge-focused-sampling", action="store_true")
+    parser.add_argument("--include-zero-target-changed-patches", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--overfit-patches", type=int, default=0)
     parser.add_argument("--overfit-samples", type=int, default=0)
     parser.add_argument("--train-repeat-factor", type=int, default=1)
@@ -767,6 +797,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-visual-gradient-improvement", type=float, default=0.0)
     parser.add_argument("--min-visual-edge-overlap", type=float, default=0.02)
     parser.add_argument("--present-threshold", type=float, default=DEFAULT_PRESENT_THRESHOLD)
+    parser.add_argument("--min-export-candidates-per-sample", type=int, default=0)
     parser.add_argument("--max-export-strokes-per-sample", type=int, default=DEFAULT_MAX_STROKES)
     parser.add_argument("--max-export-strokes-per-patch", type=int, default=DEFAULT_MAX_STROKES)
     parser.add_argument("--min-export-render-area", type=float, default=8.0)
@@ -775,6 +806,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=20260603)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--cuda-attention-backend", choices=("math", "default"), default=DEFAULT_CUDA_ATTENTION_BACKEND)
+    parser.add_argument("--early-stop-zero-selected-epochs", type=int, default=3)
     return parser
 
 
@@ -858,6 +890,70 @@ def _average_structure_metrics(entries: list[dict[str, Any]]) -> dict[str, float
         f"mean_{name}": totals[name] / counts[name] if counts[name] else 0.0
         for name in metric_names
     }
+
+
+def _average_export_filter_metrics(entries: list[dict[str, Any]]) -> dict[str, float]:
+    sum_metric_names = (
+        "candidate_count_before_threshold",
+        "candidate_count_after_threshold",
+        "candidate_count",
+        "selected_count",
+        "fallback_candidate_count",
+        "present_score_count",
+    )
+    sum_totals = {name: 0.0 for name in sum_metric_names}
+    max_present = 0.0
+    weighted_mean_present_total = 0.0
+    weighted_mean_present_count = 0.0
+    filter_count = 0
+    for entry in entries:
+        added_strokes_path = entry.get("added_strokes")
+        if not added_strokes_path:
+            continue
+        try:
+            program = _read_json(Path(added_strokes_path))
+        except OSError:
+            continue
+        export_filter = program.get("metadata", {}).get("export_filter", {})
+        if not isinstance(export_filter, dict):
+            continue
+        filter_count += 1
+        for name in sum_metric_names:
+            value = export_filter.get(name)
+            if isinstance(value, (int, float)):
+                sum_totals[name] += float(value)
+        if isinstance(export_filter.get("max_present"), (int, float)):
+            max_present = max(max_present, float(export_filter["max_present"]))
+        mean_present = export_filter.get("mean_present")
+        present_score_count = export_filter.get("present_score_count")
+        if isinstance(mean_present, (int, float)) and isinstance(present_score_count, (int, float)):
+            weighted_mean_present_total += float(mean_present) * float(present_score_count)
+            weighted_mean_present_count += float(present_score_count)
+    return {
+        "max_present": max_present,
+        "mean_present": weighted_mean_present_total / weighted_mean_present_count if weighted_mean_present_count else 0.0,
+        "candidate_count_before_threshold": sum_totals["candidate_count_before_threshold"],
+        "candidate_count_after_threshold": sum_totals["candidate_count_after_threshold"],
+        "candidate_count": sum_totals["candidate_count"],
+        "selected_count": sum_totals["selected_count"],
+        "fallback_candidate_count": sum_totals["fallback_candidate_count"],
+        "present_score_count": sum_totals["present_score_count"],
+        "export_filter_count": float(filter_count),
+    }
+
+
+def _should_early_stop_zero_selected(
+    config: VisualDeltaTrainingConfig,
+    visual_metrics: dict[str, Any] | None,
+    epoch: int,
+) -> bool:
+    if config.early_stop_zero_selected_epochs <= 0:
+        return False
+    if epoch < config.early_stop_zero_selected_epochs:
+        return False
+    if visual_metrics is None:
+        return False
+    return float(visual_metrics.get("selected_count", 0.0)) == 0.0
 
 
 if __name__ == "__main__":

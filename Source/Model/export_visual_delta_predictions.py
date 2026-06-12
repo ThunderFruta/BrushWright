@@ -61,6 +61,7 @@ class ExportVisualDeltaConfig:
     min_gradient_improvement: float = 0.0
     min_edge_overlap: float = 0.02
     present_threshold: float = DEFAULT_PRESENT_THRESHOLD
+    min_export_candidates_per_sample: int = 0
     max_strokes_per_sample: int = DEFAULT_MAX_STROKES_PER_SAMPLE
     max_strokes_per_patch: int = DEFAULT_MAX_STROKES_PER_PATCH
     min_render_area: float = DEFAULT_MIN_RENDER_AREA
@@ -91,6 +92,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             min_gradient_improvement=args.min_gradient_improvement,
             min_edge_overlap=args.min_edge_overlap,
             present_threshold=args.present_threshold,
+            min_export_candidates_per_sample=args.min_export_candidates_per_sample,
             max_strokes_per_sample=args.max_strokes_per_sample,
             max_strokes_per_patch=args.max_strokes_per_patch,
             min_render_area=args.min_render_area,
@@ -116,6 +118,8 @@ def export_visual_delta_predictions(config: ExportVisualDeltaConfig) -> list[dic
         raise ValueError("max_strokes_per_sample must be positive")
     if config.max_strokes_per_patch <= 0:
         raise ValueError("max_strokes_per_patch must be positive")
+    if config.min_export_candidates_per_sample < 0:
+        raise ValueError("min_export_candidates_per_sample must be non-negative")
     if config.recursive_passes <= 0:
         raise ValueError("recursive_passes must be positive")
     if config.strokes_per_pass <= 0:
@@ -179,6 +183,7 @@ def export_visual_delta_predictions(config: ExportVisualDeltaConfig) -> list[dic
                 checkpoint_path=checkpoint_path,
                 device=device,
                 present_threshold=config.present_threshold,
+                min_export_candidates_per_sample=config.min_export_candidates_per_sample,
                 max_strokes_per_sample=config.max_strokes_per_sample,
                 max_strokes_per_patch=config.max_strokes_per_patch,
                 min_render_area=config.min_render_area,
@@ -211,6 +216,7 @@ def _export_sample(
     checkpoint_path: Path,
     device: torch.device,
     present_threshold: float,
+    min_export_candidates_per_sample: int,
     max_strokes_per_sample: int,
     max_strokes_per_patch: int,
     min_render_area: float,
@@ -236,6 +242,7 @@ def _export_sample(
             checkpoint_path=checkpoint_path,
             device=device,
             present_threshold=present_threshold,
+            min_export_candidates_per_sample=min_export_candidates_per_sample,
             max_strokes_per_sample=max_strokes_per_sample,
             max_strokes_per_patch=max_strokes_per_patch,
             min_render_area=min_render_area,
@@ -255,6 +262,7 @@ def _export_sample(
         checkpoint_path=checkpoint_path,
         device=device,
         present_threshold=present_threshold,
+        min_export_candidates_per_sample=min_export_candidates_per_sample,
         strokes_per_pass=strokes_per_pass,
         max_strokes_per_patch=max_strokes_per_patch,
         min_render_area=min_render_area,
@@ -280,6 +288,7 @@ def _export_single_pass_sample(
     checkpoint_path: Path,
     device: torch.device,
     present_threshold: float,
+    min_export_candidates_per_sample: int,
     max_strokes_per_sample: int,
     max_strokes_per_patch: int,
     min_render_area: float,
@@ -296,7 +305,12 @@ def _export_single_pass_sample(
         for patch_index, patch in enumerate(dataset.patch_index)
         if patch.sample_id == str(sample["sample_id"]) and patch.changed
     ]
-    predicted_candidates: list[dict[str, Any]] = []
+    threshold_candidates: list[dict[str, Any]] = []
+    fallback_candidates: list[dict[str, Any]] = []
+    scored_candidate_count = 0
+    present_score_total = 0.0
+    present_score_count = 0
+    max_present = 0.0
     order = 0
     with torch.no_grad():
         for patch_index in patch_indices:
@@ -307,10 +321,12 @@ def _export_single_pass_sample(
             numeric = output.pred_numeric[0].detach().cpu()
             brush_logits = output.pred_brush_logits[0].detach().cpu()
             patch_bounds = item.patch_bounds.tolist()
-            patch_candidates: list[dict[str, Any]] = []
+            patch_threshold_candidates: list[dict[str, Any]] = []
             for slot, present_score in enumerate(present.tolist()):
-                if present_score < present_threshold:
-                    continue
+                present_score = float(present_score)
+                present_score_total += present_score
+                present_score_count += 1
+                max_present = max(max_present, present_score)
                 brush_id = int(torch.argmax(brush_logits[slot]).item())
                 brush = _brush_from_id(brush_id, checkpoint)
                 candidate_numeric = _candidate_numeric_with_residual_color(numeric[slot], item.patch_tensor)
@@ -323,20 +339,30 @@ def _export_single_pass_sample(
                 )
                 if score <= 0.0 or area_pixels < min_render_area:
                     continue
-                patch_candidates.append(
-                    {
-                        "stroke": patch_numeric_to_global_stroke(candidate_numeric.tolist(), brush, patch_bounds),
-                        "score": score,
-                        "area_pixels": area_pixels,
-                        "present_score": float(present_score),
-                        "order": order,
-                    }
-                )
+                scored_candidate_count += 1
+                candidate = {
+                    "stroke": patch_numeric_to_global_stroke(candidate_numeric.tolist(), brush, patch_bounds),
+                    "score": score,
+                    "area_pixels": area_pixels,
+                    "present_score": present_score,
+                    "passed_present_threshold": present_score >= present_threshold,
+                    "order": order,
+                }
                 order += 1
-            patch_candidates.sort(key=lambda candidate: (candidate["score"], candidate["present_score"]), reverse=True)
-            predicted_candidates.extend(patch_candidates[:max_strokes_per_patch])
+                if candidate["passed_present_threshold"]:
+                    patch_threshold_candidates.append(candidate)
+                else:
+                    fallback_candidates.append(candidate)
+            patch_threshold_candidates.sort(key=lambda candidate: (candidate["score"], candidate["present_score"]), reverse=True)
+            threshold_candidates.extend(patch_threshold_candidates[:max_strokes_per_patch])
+    predicted_candidates = _apply_export_candidate_fallback(
+        threshold_candidates=threshold_candidates,
+        fallback_candidates=fallback_candidates,
+        min_export_candidates_per_sample=min_export_candidates_per_sample,
+    )
     selected_candidates = _select_ranked_export_candidates(predicted_candidates, max_strokes_per_sample)
     predicted_strokes = [candidate["stroke"] for candidate in selected_candidates]
+    fallback_added_count = sum(1 for candidate in predicted_candidates if not candidate.get("passed_present_threshold", True))
 
     added_metadata = {
         **dict(target_program.get("metadata", {})),
@@ -345,10 +371,17 @@ def _export_single_pass_sample(
         "split": "visual_delta_added_strokes",
         "export_filter": {
             "present_threshold": present_threshold,
+            "min_export_candidates_per_sample": min_export_candidates_per_sample,
             "max_strokes_per_sample": max_strokes_per_sample,
             "max_strokes_per_patch": max_strokes_per_patch,
             "min_render_area": min_render_area,
             "ranking_mode": ranking_mode,
+            "max_present": max_present,
+            "mean_present": present_score_total / present_score_count if present_score_count else 0.0,
+            "present_score_count": present_score_count,
+            "candidate_count_before_threshold": scored_candidate_count,
+            "candidate_count_after_threshold": len(threshold_candidates),
+            "fallback_candidate_count": fallback_added_count,
             "candidate_count": len(predicted_candidates),
             "selected_count": len(predicted_strokes),
         },
@@ -428,6 +461,7 @@ def _export_recursive_sample(
     checkpoint_path: Path,
     device: torch.device,
     present_threshold: float,
+    min_export_candidates_per_sample: int,
     strokes_per_pass: int,
     max_strokes_per_patch: int,
     min_render_area: float,
@@ -471,6 +505,7 @@ def _export_recursive_sample(
             checkpoint=checkpoint,
             device=device,
             present_threshold=present_threshold,
+            min_export_candidates_per_sample=min_export_candidates_per_sample,
             max_strokes_per_patch=max_strokes_per_patch,
             min_render_area=min_render_area,
             ranking_mode=ranking_mode,
@@ -489,6 +524,7 @@ def _export_recursive_sample(
                 "recursive_pass": pass_index,
                 "export_filter": {
                     "present_threshold": present_threshold,
+                    "min_export_candidates_per_sample": min_export_candidates_per_sample,
                     "strokes_per_pass": strokes_per_pass,
                     "max_strokes_per_patch": max_strokes_per_patch,
                     "min_render_area": min_render_area,
@@ -677,6 +713,7 @@ def _export_summary(exported: list[dict[str, Any]]) -> dict[str, Any]:
         **_average_structure_metrics(rendered),
         "checkpoint_status": "visual_pass" if visual_pass else "visual_failed",
         "status_histogram": _status_histogram(exported),
+        **_average_export_filter_metrics(exported),
     }
 
 
@@ -690,6 +727,7 @@ def _predict_sample_candidates(
     checkpoint: dict[str, Any],
     device: torch.device,
     present_threshold: float,
+    min_export_candidates_per_sample: int,
     max_strokes_per_patch: int,
     min_render_area: float,
     ranking_mode: str,
@@ -701,7 +739,8 @@ def _predict_sample_candidates(
     edit_mask = _build_edit_mask(error_map, dataset.mask_threshold)
     finishing_program = _read_json(sample_dir / sample["finishing_strokes"])
     finishing_strokes = finishing_program["strokes"]
-    candidates: list[dict[str, Any]] = []
+    threshold_candidates: list[dict[str, Any]] = []
+    fallback_candidates: list[dict[str, Any]] = []
     order = 0
     with torch.no_grad():
         for top in _patch_offsets(DEFAULT_IMAGE_SIZE, dataset.patch_size, dataset.patch_stride):
@@ -737,10 +776,9 @@ def _predict_sample_candidates(
                     (left + dataset.patch_size) / DEFAULT_IMAGE_SIZE,
                     (top + dataset.patch_size) / DEFAULT_IMAGE_SIZE,
                 ]
-                patch_candidates: list[dict[str, Any]] = []
+                patch_threshold_candidates: list[dict[str, Any]] = []
                 for slot, present_score in enumerate(present.tolist()):
-                    if present_score < present_threshold:
-                        continue
+                    present_score = float(present_score)
                     brush_id = int(torch.argmax(brush_logits[slot]).item())
                     brush = _brush_from_id(brush_id, checkpoint)
                     candidate_numeric = _candidate_numeric_with_residual_color(numeric[slot], patch_tensor)
@@ -756,19 +794,26 @@ def _predict_sample_candidates(
                     stroke = patch_numeric_to_global_stroke(candidate_numeric.tolist(), brush, patch_bounds)
                     if _stroke_key(stroke) in stroke_keys:
                         continue
-                    patch_candidates.append(
-                        {
-                            "stroke": stroke,
-                            "score": score,
-                            "area_pixels": area_pixels,
-                            "present_score": float(present_score),
-                            "order": order,
-                        }
-                    )
+                    candidate = {
+                        "stroke": stroke,
+                        "score": score,
+                        "area_pixels": area_pixels,
+                        "present_score": present_score,
+                        "passed_present_threshold": present_score >= present_threshold,
+                        "order": order,
+                    }
                     order += 1
-                patch_candidates.sort(key=lambda candidate: (candidate["score"], candidate["present_score"]), reverse=True)
-                candidates.extend(patch_candidates[:max_strokes_per_patch])
-    return candidates
+                    if candidate["passed_present_threshold"]:
+                        patch_threshold_candidates.append(candidate)
+                    else:
+                        fallback_candidates.append(candidate)
+                patch_threshold_candidates.sort(key=lambda candidate: (candidate["score"], candidate["present_score"]), reverse=True)
+                threshold_candidates.extend(patch_threshold_candidates[:max_strokes_per_patch])
+    return _apply_export_candidate_fallback(
+        threshold_candidates=threshold_candidates,
+        fallback_candidates=fallback_candidates,
+        min_export_candidates_per_sample=min_export_candidates_per_sample,
+    )
 
 
 def _runtime_patch_tensor(
@@ -895,6 +940,56 @@ def _average_structure_metrics(entries: list[dict[str, Any]]) -> dict[str, float
     }
 
 
+def _average_export_filter_metrics(entries: list[dict[str, Any]]) -> dict[str, float]:
+    sum_metric_names = (
+        "candidate_count_before_threshold",
+        "candidate_count_after_threshold",
+        "candidate_count",
+        "selected_count",
+        "fallback_candidate_count",
+        "present_score_count",
+    )
+    sum_totals = {name: 0.0 for name in sum_metric_names}
+    max_present = 0.0
+    weighted_mean_present_total = 0.0
+    weighted_mean_present_count = 0.0
+    filter_count = 0
+    for entry in entries:
+        added_strokes_path = entry.get("added_strokes")
+        if not added_strokes_path:
+            continue
+        try:
+            program = _read_json(Path(added_strokes_path))
+        except OSError:
+            continue
+        export_filter = program.get("metadata", {}).get("export_filter", {})
+        if not isinstance(export_filter, dict):
+            continue
+        filter_count += 1
+        for name in sum_metric_names:
+            value = export_filter.get(name)
+            if isinstance(value, (int, float)):
+                sum_totals[name] += float(value)
+        if isinstance(export_filter.get("max_present"), (int, float)):
+            max_present = max(max_present, float(export_filter["max_present"]))
+        mean_present = export_filter.get("mean_present")
+        present_score_count = export_filter.get("present_score_count")
+        if isinstance(mean_present, (int, float)) and isinstance(present_score_count, (int, float)):
+            weighted_mean_present_total += float(mean_present) * float(present_score_count)
+            weighted_mean_present_count += float(present_score_count)
+    return {
+        "max_present": max_present,
+        "mean_present": weighted_mean_present_total / weighted_mean_present_count if weighted_mean_present_count else 0.0,
+        "candidate_count_before_threshold": sum_totals["candidate_count_before_threshold"],
+        "candidate_count_after_threshold": sum_totals["candidate_count_after_threshold"],
+        "candidate_count": sum_totals["candidate_count"],
+        "selected_count": sum_totals["selected_count"],
+        "fallback_candidate_count": sum_totals["fallback_candidate_count"],
+        "present_score_count": sum_totals["present_score_count"],
+        "export_filter_count": float(filter_count),
+    }
+
+
 def _program_without_validation(template: dict[str, Any], metadata: dict[str, Any], strokes: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "version": template["version"],
@@ -987,6 +1082,26 @@ def _select_ranked_export_candidates(
     )
     selected = ranked[:max_strokes_per_sample]
     return sorted(selected, key=lambda candidate: int(candidate.get("order", 0)))
+
+
+def _apply_export_candidate_fallback(
+    threshold_candidates: list[dict[str, Any]],
+    fallback_candidates: list[dict[str, Any]],
+    min_export_candidates_per_sample: int,
+) -> list[dict[str, Any]]:
+    if min_export_candidates_per_sample < 0:
+        raise ValueError("min_export_candidates_per_sample must be non-negative")
+    selected = list(threshold_candidates)
+    needed = max(0, min_export_candidates_per_sample - len(selected))
+    if needed <= 0:
+        return selected
+    ranked_fallback = sorted(
+        fallback_candidates,
+        key=lambda candidate: (float(candidate.get("score", 0.0)), float(candidate.get("present_score", 0.0))),
+        reverse=True,
+    )
+    selected.extend(ranked_fallback[:needed])
+    return selected
 
 
 def _stroke_render_area_pixels(numeric: torch.Tensor, height: int, width: int) -> float:
@@ -1084,6 +1199,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-gradient-improvement", type=float, default=0.0)
     parser.add_argument("--min-edge-overlap", type=float, default=0.02)
     parser.add_argument("--present-threshold", type=float, default=DEFAULT_PRESENT_THRESHOLD)
+    parser.add_argument("--min-export-candidates-per-sample", type=int, default=0)
     parser.add_argument("--max-strokes-per-sample", type=int, default=DEFAULT_MAX_STROKES_PER_SAMPLE)
     parser.add_argument("--max-strokes-per-patch", type=int, default=DEFAULT_MAX_STROKES_PER_PATCH)
     parser.add_argument("--min-render-area", type=float, default=DEFAULT_MIN_RENDER_AREA)

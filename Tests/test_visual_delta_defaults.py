@@ -46,12 +46,15 @@ class VisualDeltaDefaultsTest(unittest.TestCase):
         self.assertEqual(config.training_renderer, "paint-transformer-soft")
         self.assertEqual(config.output_dir.name, "VisualDeltaStrokeCompilerV8UsableV1Large")
         self.assertEqual(config.require_target_contract, "paint_transformer_original_image_target_v1")
+        self.assertTrue(config.include_zero_target_changed_patches)
         self.assertTrue(config.slot_aware_targets)
         self.assertGreater(config.anti_dot_weight, 0.0)
+        self.assertEqual(config.min_export_candidates_per_sample, 0)
         self.assertEqual(config.max_export_strokes_per_sample, 512)
         self.assertEqual(config.max_export_strokes_per_patch, 512)
         self.assertAlmostEqual(config.present_threshold, 0.05)
         self.assertGreater(config.present_positive_weight, 1.0)
+        self.assertEqual(config.early_stop_zero_selected_epochs, 3)
 
     def test_visual_delta_model_defaults_include_mixed_scale_proposals(self) -> None:
         from Source.Model.visual_delta_predictor import VisualDeltaStrokeCompilerConfig
@@ -101,6 +104,7 @@ class VisualDeltaDefaultsTest(unittest.TestCase):
         self.assertEqual(config.checkpoint.parent.name, "VisualDeltaStrokeCompilerV8UsableV1Large")
         self.assertIsNone(config.sample_id)
         self.assertAlmostEqual(config.present_threshold, 0.05)
+        self.assertEqual(config.min_export_candidates_per_sample, 0)
         self.assertEqual(config.max_strokes_per_patch, 512)
         self.assertFalse(config.allow_visual_failed_checkpoint)
         self.assertEqual(config.recursive_passes, 1)

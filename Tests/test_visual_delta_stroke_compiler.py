@@ -191,6 +191,40 @@ class VisualDeltaStrokeCompilerTest(unittest.TestCase):
             self.assertAlmostEqual(float(item.target_numeric[0, 0].item()), 0.4, places=3)
             self.assertAlmostEqual(float(item.target_numeric[0, 1].item()), 0.4, places=3)
 
+    def test_dataset_can_exclude_zero_target_changed_patches(self) -> None:
+        from Source.Model import VisualDeltaStrokeDataset
+
+        with tempfile.TemporaryDirectory() as root_name:
+            split_root = Path(root_name) / "Train"
+            split_root.mkdir()
+            _write_sample(split_root, finishing_strokes=[_stroke(0.2, 0.2)])
+            _write_manifest(split_root, ["sample_a"])
+
+            default_dataset = VisualDeltaStrokeDataset(
+                split_root,
+                patch_size=128,
+                patch_stride=128,
+                negative_patch_ratio=0.0,
+            )
+            positive_only_dataset = VisualDeltaStrokeDataset(
+                split_root,
+                patch_size=128,
+                patch_stride=128,
+                negative_patch_ratio=0.0,
+                include_zero_target_changed_patches=False,
+            )
+
+            default_zero_target_changed = [
+                patch for patch in default_dataset.patch_index if patch.changed and patch.target_stroke_count == 0
+            ]
+            positive_only_zero_target_changed = [
+                patch for patch in positive_only_dataset.patch_index if patch.changed and patch.target_stroke_count == 0
+            ]
+
+            self.assertGreater(len(default_zero_target_changed), 0)
+            self.assertEqual(positive_only_zero_target_changed, [])
+            self.assertTrue(all(patch.target_stroke_count > 0 for patch in positive_only_dataset.patch_index if patch.changed))
+
     def test_patch_numeric_round_trips_to_global_stroke(self) -> None:
         from Source.Model import patch_numeric_to_global_stroke
 
@@ -839,6 +873,23 @@ class VisualDeltaStrokeCompilerTest(unittest.TestCase):
         self.assertEqual(len(selected), 3)
         self.assertEqual([entry["stroke"]["x"] for entry in selected], [7, 8, 9])
 
+    def test_export_fallback_selects_ranked_candidates(self) -> None:
+        from Source.Model.export_visual_delta_predictions import _apply_export_candidate_fallback
+
+        fallback_candidates = [
+            {"stroke": {"x": "low"}, "score": 1.0, "present_score": 0.01, "order": 0},
+            {"stroke": {"x": "best"}, "score": 2.0, "present_score": 0.04, "order": 1},
+            {"stroke": {"x": "mid"}, "score": 1.5, "present_score": 0.03, "order": 2},
+        ]
+
+        selected = _apply_export_candidate_fallback(
+            threshold_candidates=[],
+            fallback_candidates=fallback_candidates,
+            min_export_candidates_per_sample=2,
+        )
+
+        self.assertEqual([entry["stroke"]["x"] for entry in selected], ["best", "mid"])
+
     def test_export_summary_rejects_low_change_improvement(self) -> None:
         from Source.Model.export_visual_delta_predictions import _export_summary
 
@@ -854,6 +905,83 @@ class VisualDeltaStrokeCompilerTest(unittest.TestCase):
         self.assertEqual(summary["visual_improvement_rate"], 1.0)
         self.assertEqual(summary["low_change_rate"], 1.0)
         self.assertEqual(summary["checkpoint_status"], "visual_failed")
+
+    def test_export_summary_includes_presence_candidate_stats(self) -> None:
+        from Source.Model.export_visual_delta_predictions import _export_summary
+
+        with tempfile.TemporaryDirectory() as root_name:
+            root = Path(root_name)
+            added_strokes = root / "added_strokes.json"
+            _write_json(
+                added_strokes,
+                {
+                    "version": 1,
+                    "canvas": {"width": 512, "height": 512},
+                    "metadata": {
+                        "export_filter": {
+                            "max_present": 0.04,
+                            "mean_present": 0.02,
+                            "present_score_count": 10,
+                            "candidate_count_before_threshold": 7,
+                            "candidate_count_after_threshold": 0,
+                            "candidate_count": 2,
+                            "selected_count": 2,
+                            "fallback_candidate_count": 2,
+                        },
+                    },
+                    "strokes": [],
+                },
+            )
+
+            summary = _export_summary(
+                [
+                    {
+                        "status": "failed_low_pixel_change",
+                        "visual_improved": True,
+                        "added_strokes": str(added_strokes),
+                    }
+                ]
+            )
+
+        self.assertAlmostEqual(summary["max_present"], 0.04)
+        self.assertAlmostEqual(summary["mean_present"], 0.02)
+        self.assertEqual(summary["candidate_count_before_threshold"], 7.0)
+        self.assertEqual(summary["candidate_count_after_threshold"], 0.0)
+        self.assertEqual(summary["selected_count"], 2.0)
+
+    def test_visual_validation_summary_helper_includes_presence_candidate_stats(self) -> None:
+        from Source.Model.train_visual_delta_strokes import _average_export_filter_metrics
+
+        with tempfile.TemporaryDirectory() as root_name:
+            root = Path(root_name)
+            added_strokes = root / "added_strokes.json"
+            _write_json(
+                added_strokes,
+                {
+                    "version": 1,
+                    "canvas": {"width": 512, "height": 512},
+                    "metadata": {
+                        "export_filter": {
+                            "max_present": 0.03,
+                            "mean_present": 0.01,
+                            "present_score_count": 20,
+                            "candidate_count_before_threshold": 5,
+                            "candidate_count_after_threshold": 1,
+                            "candidate_count": 3,
+                            "selected_count": 3,
+                            "fallback_candidate_count": 2,
+                        },
+                    },
+                    "strokes": [],
+                },
+            )
+            metrics = _average_export_filter_metrics([{"added_strokes": str(added_strokes)}])
+
+        self.assertAlmostEqual(metrics["max_present"], 0.03)
+        self.assertAlmostEqual(metrics["mean_present"], 0.01)
+        self.assertEqual(metrics["candidate_count_before_threshold"], 5.0)
+        self.assertEqual(metrics["candidate_count_after_threshold"], 1.0)
+        self.assertEqual(metrics["selected_count"], 3.0)
 
     def test_visual_delta_export_rejects_non_best_checkpoint_by_default(self) -> None:
         from pathlib import Path

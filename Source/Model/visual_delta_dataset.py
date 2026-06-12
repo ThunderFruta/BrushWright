@@ -90,6 +90,7 @@ class VisualDeltaStrokeDataset(Dataset):
         cache_samples: bool = True,
         require_structure_targets: bool = False,
         require_target_contract: str | None = None,
+        include_zero_target_changed_patches: bool = True,
     ) -> None:
         if patch_size <= 0:
             raise ValueError("patch_size must be positive")
@@ -114,6 +115,7 @@ class VisualDeltaStrokeDataset(Dataset):
         self.cache_samples = cache_samples
         self.require_structure_targets = require_structure_targets
         self.require_target_contract = require_target_contract
+        self.include_zero_target_changed_patches = include_zero_target_changed_patches
         self.tokenizer = tokenizer or StrokeTokenizer(max_strokes=max_strokes_per_patch)
         self.manifest = _read_json(self.split_root / "dataset_manifest.json")
         self.patch_index = self._build_patch_index()
@@ -205,7 +207,8 @@ class VisualDeltaStrokeDataset(Dataset):
                         priority_score=priority_score,
                     )
                     if is_changed:
-                        changed.append(patch)
+                        if target_stroke_count > 0 or self.include_zero_target_changed_patches:
+                            changed.append(patch)
                     else:
                         unchanged.append(patch)
             if changed:
