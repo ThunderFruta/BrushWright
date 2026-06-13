@@ -106,6 +106,10 @@ class VisualDeltaTrainingConfig:
     visual_validation_samples: int = 8
     visual_validation_device: str = "cpu"
     visual_validation_interval: int = 1
+    epoch_sample_report: bool = True
+    epoch_sample_report_train_count: int = 2
+    epoch_sample_report_val_count: int = 2
+    epoch_sample_report_interval: int = 1
     min_visual_changed_pixel_ratio: float = 0.005
     min_visual_gradient_improvement: float = 0.0
     min_visual_edge_overlap: float = 0.02
@@ -173,6 +177,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         visual_validation_samples=args.visual_validation_samples,
         visual_validation_device=args.visual_validation_device,
         visual_validation_interval=args.visual_validation_interval,
+        epoch_sample_report=args.epoch_sample_report,
+        epoch_sample_report_train_count=args.epoch_sample_report_train_count,
+        epoch_sample_report_val_count=args.epoch_sample_report_val_count,
+        epoch_sample_report_interval=args.epoch_sample_report_interval,
         min_visual_changed_pixel_ratio=args.min_visual_changed_pixel_ratio,
         min_visual_gradient_improvement=args.min_visual_gradient_improvement,
         min_visual_edge_overlap=args.min_visual_edge_overlap,
@@ -269,6 +277,15 @@ def train_visual_delta_strokes(config: VisualDeltaTrainingConfig) -> dict[str, A
     model = VisualDeltaStrokeCompiler(model_config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     config.output_dir.mkdir(parents=True, exist_ok=True)
+    epoch_sample_report_manifest = _prepare_epoch_sample_report_manifest(config)
+    if epoch_sample_report_manifest is not None:
+        print(
+            "  epoch sample report: "
+            f"Train={len(epoch_sample_report_manifest['samples']['Train'])} "
+            f"Val={len(epoch_sample_report_manifest['samples']['Val'])} "
+            f"interval={config.epoch_sample_report_interval}",
+            flush=True,
+        )
 
     metrics: list[dict[str, Any]] = []
     best_val_loss = float("inf")
@@ -314,6 +331,14 @@ def train_visual_delta_strokes(config: VisualDeltaTrainingConfig) -> dict[str, A
             checkpoint_type="epoch",
         )
         print(f"  wrote {config.output_dir / 'latest.pt'}", flush=True)
+        epoch_sample_report = _run_epoch_sample_report(config, epoch, epoch_sample_report_manifest)
+        if epoch_sample_report is not None:
+            epoch_metrics["sample_report"] = epoch_sample_report
+            print(
+                f"  epoch sample report: samples={len(epoch_sample_report['samples'])} "
+                f"contact_sheet={epoch_sample_report['contact_sheet']}",
+                flush=True,
+            )
         visual_metrics = _run_visual_validation(config, epoch)
         if visual_metrics is not None:
             epoch_metrics["visual"] = visual_metrics
@@ -568,6 +593,10 @@ def _save_checkpoint(
                 "size_distribution_weight": dataset_config.size_distribution_weight,
                 "slot_aware_targets": dataset_config.slot_aware_targets,
                 "training_renderer": dataset_config.training_renderer,
+                "epoch_sample_report": dataset_config.epoch_sample_report,
+                "epoch_sample_report_train_count": dataset_config.epoch_sample_report_train_count,
+                "epoch_sample_report_val_count": dataset_config.epoch_sample_report_val_count,
+                "epoch_sample_report_interval": dataset_config.epoch_sample_report_interval,
                 "present_threshold": dataset_config.present_threshold,
                 "min_export_candidates_per_sample": dataset_config.min_export_candidates_per_sample,
                 "present_positive_weight": dataset_config.present_positive_weight,
@@ -650,6 +679,162 @@ def _run_visual_validation(config: VisualDeltaTrainingConfig, epoch: int) -> dic
     return summary
 
 
+def _prepare_epoch_sample_report_manifest(config: VisualDeltaTrainingConfig) -> dict[str, Any] | None:
+    if not config.epoch_sample_report:
+        return None
+    samples = {
+        "Train": _select_epoch_sample_ids(config.data_root, "Train", config.epoch_sample_report_train_count),
+        "Val": _select_epoch_sample_ids(config.data_root, "Val", config.epoch_sample_report_val_count),
+    }
+    if not samples["Train"] and not samples["Val"]:
+        return None
+    manifest = {
+        "version": 1,
+        "train_count_requested": config.epoch_sample_report_train_count,
+        "val_count_requested": config.epoch_sample_report_val_count,
+        "interval": config.epoch_sample_report_interval,
+        "samples": samples,
+    }
+    _write_json(config.output_dir / "epoch_sample_report_manifest.json", manifest)
+    return manifest
+
+
+def _select_epoch_sample_ids(data_root: Path, split: str, requested_count: int) -> list[str]:
+    if requested_count <= 0:
+        return []
+    manifest = _read_json(data_root / split / "dataset_manifest.json")
+    sample_entries = manifest.get("samples", [])
+    if not isinstance(sample_entries, list):
+        raise ValueError(f"{data_root / split / 'dataset_manifest.json'} must contain a samples list")
+    selected: list[str] = []
+    for sample_entry in sample_entries:
+        sample_id = str(sample_entry.get("sample_id", ""))
+        if sample_id and sample_id not in selected:
+            selected.append(sample_id)
+        if len(selected) >= requested_count:
+            break
+    return selected
+
+
+def _run_epoch_sample_report(
+    config: VisualDeltaTrainingConfig,
+    epoch: int,
+    report_manifest: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if report_manifest is None:
+        return None
+    if epoch % config.epoch_sample_report_interval != 0 and epoch != config.epochs:
+        return None
+    from Source.Model.export_visual_delta_predictions import ExportVisualDeltaConfig, export_visual_delta_predictions
+
+    epoch_root = config.output_dir / "EpochSamples" / f"epoch_{epoch:04d}"
+    sample_entries: list[dict[str, Any]] = []
+    for split in ("Train", "Val"):
+        sample_ids = tuple(report_manifest["samples"].get(split, ()))
+        if not sample_ids:
+            continue
+        exported = export_visual_delta_predictions(
+            ExportVisualDeltaConfig(
+                data_root=config.data_root,
+                checkpoint=config.output_dir / "latest.pt",
+                output_root=epoch_root,
+                split=split,
+                sample_ids=sample_ids,
+                limit=max(1, len(sample_ids)),
+                device=config.visual_validation_device,
+                cuda_attention_backend=config.cuda_attention_backend,
+                min_changed_pixel_ratio=config.min_visual_changed_pixel_ratio,
+                min_gradient_improvement=config.min_visual_gradient_improvement,
+                min_edge_overlap=config.min_visual_edge_overlap,
+                present_threshold=config.present_threshold,
+                min_export_candidates_per_sample=config.min_export_candidates_per_sample,
+                max_strokes_per_sample=config.max_export_strokes_per_sample,
+                max_strokes_per_patch=config.max_export_strokes_per_patch,
+                min_render_area=config.min_export_render_area,
+                ranking_mode=config.export_ranking_mode,
+                allow_visual_failed_checkpoint=True,
+            )
+        )
+        sample_entries.extend(_epoch_sample_report_entry(split, entry) for entry in exported)
+    contact_sheet = epoch_root / "contact_sheet.png"
+    _write_epoch_sample_contact_sheet(sample_entries, contact_sheet)
+    report = {
+        "version": 1,
+        "epoch": epoch,
+        "output_root": str(epoch_root),
+        "selected_samples": report_manifest["samples"],
+        "samples": sample_entries,
+        "contact_sheet": str(contact_sheet),
+    }
+    _write_json(epoch_root / "epoch_sample_report.json", report)
+    return report
+
+
+def _epoch_sample_report_entry(split: str, exported: dict[str, Any]) -> dict[str, Any]:
+    diagnostics = _read_json(Path(exported["diagnostics"])) if exported.get("diagnostics") else {}
+    added_program = _read_json(Path(exported["added_strokes"])) if exported.get("added_strokes") else {}
+    export_filter = added_program.get("metadata", {}).get("export_filter", {})
+    image_deltas = diagnostics.get("image_deltas", {})
+    draft_to_predicted = image_deltas.get("draft_to_predicted", {})
+    structure_metrics = diagnostics.get("structure_metrics", {})
+    predicted_strokes = diagnostics.get("predicted_strokes", {})
+    return {
+        "split": split,
+        "sample_id": exported.get("sample_id"),
+        "status": exported.get("status"),
+        "visual_improved": exported.get("visual_improved"),
+        "predicted_stroke_count": predicted_strokes.get("count"),
+        "changed_pixel_ratio": draft_to_predicted.get("changed_pixel_ratio"),
+        "masked_mad_improvement": structure_metrics.get("masked_mad_improvement"),
+        "max_present": export_filter.get("max_present"),
+        "mean_present": export_filter.get("mean_present"),
+        "candidate_count_before_threshold": export_filter.get("candidate_count_before_threshold"),
+        "candidate_count_after_threshold": export_filter.get("candidate_count_after_threshold"),
+        "selected_count": export_filter.get("selected_count"),
+        "draft": exported.get("draft"),
+        "target": exported.get("target"),
+        "predicted": exported.get("predicted"),
+        "comparison": exported.get("comparison"),
+        "diagnostics": exported.get("diagnostics"),
+        "added_strokes": exported.get("added_strokes"),
+    }
+
+
+def _write_epoch_sample_contact_sheet(entries: list[dict[str, Any]], output_path: Path) -> None:
+    from PIL import Image, ImageDraw
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    image_keys = ("draft", "target", "predicted", "comparison")
+    cell_size = 160
+    label_width = 190
+    header_height = 28
+    row_height = cell_size + 28
+    width = label_width + len(image_keys) * cell_size
+    height = header_height + max(1, len(entries)) * row_height
+    sheet = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(sheet)
+    for column, title in enumerate(image_keys):
+        draw.text((label_width + column * cell_size + 8, 8), title, fill=(0, 0, 0))
+    if not entries:
+        draw.text((8, header_height + 8), "no samples", fill=(0, 0, 0))
+        sheet.save(output_path)
+        return
+    for row, entry in enumerate(entries):
+        y = header_height + row * row_height
+        draw.text((8, y + 8), f"{entry['split']} {entry['sample_id']}", fill=(0, 0, 0))
+        draw.text((8, y + 24), str(entry.get("status", "")), fill=(80, 80, 80))
+        for column, key in enumerate(image_keys):
+            image_path = entry.get(key)
+            if not image_path:
+                continue
+            with Image.open(image_path) as image:
+                preview = image.convert("RGB")
+                preview.thumbnail((cell_size, cell_size))
+                x = label_width + column * cell_size + (cell_size - preview.width) // 2
+                sheet.paste(preview, (x, y + 24))
+    sheet.save(output_path)
+
+
 def _base_dataset(dataset):
     if isinstance(dataset, Subset):
         return _base_dataset(dataset.dataset)
@@ -719,6 +904,12 @@ def _validate_config(config: VisualDeltaTrainingConfig) -> None:
         raise ValueError("train_repeat_factor must be positive")
     if config.visual_validation_interval <= 0:
         raise ValueError("visual_validation_interval must be positive")
+    if config.epoch_sample_report_train_count < 0:
+        raise ValueError("epoch_sample_report_train_count must be non-negative")
+    if config.epoch_sample_report_val_count < 0:
+        raise ValueError("epoch_sample_report_val_count must be non-negative")
+    if config.epoch_sample_report_interval <= 0:
+        raise ValueError("epoch_sample_report_interval must be positive")
     if not 0.0 <= config.present_threshold <= 1.0:
         raise ValueError("present_threshold must be in [0, 1]")
     if config.max_export_strokes_per_sample <= 0:
@@ -793,6 +984,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--visual-validation-samples", type=int, default=8)
     parser.add_argument("--visual-validation-device", default="cpu")
     parser.add_argument("--visual-validation-interval", type=int, default=1)
+    parser.add_argument("--epoch-sample-report", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--epoch-sample-report-train-count", type=int, default=2)
+    parser.add_argument("--epoch-sample-report-val-count", type=int, default=2)
+    parser.add_argument("--epoch-sample-report-interval", type=int, default=1)
     parser.add_argument("--min-visual-changed-pixel-ratio", type=float, default=0.005)
     parser.add_argument("--min-visual-gradient-improvement", type=float, default=0.0)
     parser.add_argument("--min-visual-edge-overlap", type=float, default=0.02)

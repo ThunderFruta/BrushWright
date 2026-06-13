@@ -983,6 +983,112 @@ class VisualDeltaStrokeCompilerTest(unittest.TestCase):
         self.assertEqual(metrics["candidate_count_after_threshold"], 1.0)
         self.assertEqual(metrics["selected_count"], 3.0)
 
+    def test_epoch_sample_selection_is_fixed_and_caps_available_samples(self) -> None:
+        from Source.Model.train_visual_delta_strokes import _select_epoch_sample_ids
+
+        with tempfile.TemporaryDirectory() as root_name:
+            data_root = Path(root_name) / "Data"
+            train_root = data_root / "Train"
+            val_root = data_root / "Val"
+            train_root.mkdir(parents=True)
+            val_root.mkdir(parents=True)
+            _write_manifest(train_root, ["sample_a", "sample_b"])
+            _write_manifest(val_root, ["sample_c"])
+
+            first = _select_epoch_sample_ids(data_root, "Train", 5)
+            second = _select_epoch_sample_ids(data_root, "Train", 5)
+            val = _select_epoch_sample_ids(data_root, "Val", 2)
+
+        self.assertEqual(first, ["sample_a", "sample_b"])
+        self.assertEqual(second, first)
+        self.assertEqual(val, ["sample_c"])
+
+    def test_epoch_sample_report_entry_includes_visual_metrics(self) -> None:
+        from Source.Model.train_visual_delta_strokes import _epoch_sample_report_entry
+
+        with tempfile.TemporaryDirectory() as root_name:
+            root = Path(root_name)
+            diagnostics = root / "diagnostics.json"
+            added_strokes = root / "added_strokes.json"
+            _write_json(
+                diagnostics,
+                {
+                    "status": "improved",
+                    "visual_improved": True,
+                    "predicted_strokes": {"count": 12},
+                    "image_deltas": {"draft_to_predicted": {"changed_pixel_ratio": 0.25}},
+                    "structure_metrics": {"masked_mad_improvement": 0.125},
+                },
+            )
+            _write_json(
+                added_strokes,
+                {
+                    "version": 1,
+                    "canvas": {"width": 512, "height": 512},
+                    "metadata": {
+                        "export_filter": {
+                            "max_present": 0.8,
+                            "mean_present": 0.4,
+                            "candidate_count_before_threshold": 9,
+                            "candidate_count_after_threshold": 7,
+                            "selected_count": 6,
+                        },
+                    },
+                    "strokes": [],
+                },
+            )
+            entry = _epoch_sample_report_entry(
+                "Val",
+                {
+                    "sample_id": "sample_a",
+                    "status": "improved",
+                    "visual_improved": True,
+                    "draft": str(root / "draft.png"),
+                    "target": str(root / "target.png"),
+                    "predicted": str(root / "predicted.png"),
+                    "comparison": str(root / "comparison.png"),
+                    "diagnostics": str(diagnostics),
+                    "added_strokes": str(added_strokes),
+                },
+            )
+
+        self.assertEqual(entry["split"], "Val")
+        self.assertEqual(entry["sample_id"], "sample_a")
+        self.assertEqual(entry["predicted_stroke_count"], 12)
+        self.assertAlmostEqual(entry["changed_pixel_ratio"], 0.25)
+        self.assertAlmostEqual(entry["masked_mad_improvement"], 0.125)
+        self.assertAlmostEqual(entry["max_present"], 0.8)
+        self.assertEqual(entry["candidate_count_after_threshold"], 7)
+
+    def test_epoch_sample_contact_sheet_writes_png(self) -> None:
+        from PIL import Image
+
+        from Source.Model.train_visual_delta_strokes import _write_epoch_sample_contact_sheet
+
+        with tempfile.TemporaryDirectory() as root_name:
+            root = Path(root_name)
+            image_paths = {}
+            for name, color in (
+                ("draft", (10, 20, 30)),
+                ("target", (40, 50, 60)),
+                ("predicted", (70, 80, 90)),
+                ("comparison", (100, 110, 120)),
+            ):
+                path = root / f"{name}.png"
+                Image.new("RGB", (16, 16), color).save(path)
+                image_paths[name] = str(path)
+            output_path = root / "contact_sheet.png"
+            _write_epoch_sample_contact_sheet(
+                [{"split": "Train", "sample_id": "sample_a", "status": "improved", **image_paths}],
+                output_path,
+            )
+
+            with Image.open(output_path) as image:
+                size = image.size
+
+        self.assertGreater(size[0], 0)
+        self.assertGreater(size[1], 0)
+
     def test_visual_delta_export_rejects_non_best_checkpoint_by_default(self) -> None:
         from pathlib import Path
 
@@ -1500,6 +1606,12 @@ class VisualDeltaStrokeCompilerTest(unittest.TestCase):
             self.assertIn("dataset_config", checkpoint)
             self.assertEqual(checkpoint["epoch"], 1)
             self.assertFalse((output_dir / "best.pt").exists())
+            self.assertTrue((output_dir / "epoch_sample_report_manifest.json").exists())
+            self.assertTrue((output_dir / "EpochSamples" / "epoch_0001" / "contact_sheet.png").exists())
+            self.assertTrue((output_dir / "EpochSamples" / "epoch_0001" / "epoch_sample_report.json").exists())
+            self.assertTrue(
+                any((output_dir / "EpochSamples" / "epoch_0001").glob("*/*/comparison.png"))
+            )
 
     def test_overfit_samples_selects_whole_sample_patch_set(self) -> None:
         from Source.Model import VisualDeltaStrokeDataset

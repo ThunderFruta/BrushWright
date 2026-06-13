@@ -54,6 +54,7 @@ class ExportVisualDeltaConfig:
     output_root: Path = DEFAULT_OUTPUT_ROOT
     split: str = DEFAULT_SPLIT
     sample_id: str | None = None
+    sample_ids: tuple[str, ...] = ()
     limit: int = DEFAULT_LIMIT
     device: str = "auto"
     cuda_attention_backend: str = DEFAULT_CUDA_ATTENTION_BACKEND
@@ -84,7 +85,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             checkpoint=args.checkpoint,
             output_root=args.output_root,
             split=args.split,
-            sample_id=args.sample_id,
+            sample_ids=tuple(args.sample_id or ()),
             limit=args.limit,
             device=args.device,
             cuda_attention_backend=args.cuda_attention_backend,
@@ -144,10 +145,19 @@ def export_visual_delta_predictions(config: ExportVisualDeltaConfig) -> list[dic
     split_root = config.data_root / config.split
     manifest = _read_json(split_root / "dataset_manifest.json")
     manifest_samples = list(manifest.get("samples", []))
+    if config.sample_id is not None and config.sample_ids:
+        raise ValueError("use either sample_id or sample_ids, not both")
     if config.sample_id is not None:
         samples = [entry for entry in manifest_samples if str(entry.get("sample_id")) == config.sample_id]
         if not samples:
             raise ValueError(f"sample_id not found in {config.split}: {config.sample_id}")
+    elif config.sample_ids:
+        requested = {str(sample_id) for sample_id in config.sample_ids}
+        samples = [entry for entry in manifest_samples if str(entry.get("sample_id")) in requested]
+        found = {str(entry.get("sample_id")) for entry in samples}
+        missing = sorted(requested - found)
+        if missing:
+            raise ValueError(f"sample_id(s) not found in {config.split}: {', '.join(missing)}")
     else:
         samples = manifest_samples[: config.limit]
     dataset = VisualDeltaStrokeDataset(
@@ -1191,7 +1201,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--split", default=DEFAULT_SPLIT)
-    parser.add_argument("--sample-id", default=None)
+    parser.add_argument("--sample-id", action="append", default=None)
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--cuda-attention-backend", choices=("math", "default"), default=DEFAULT_CUDA_ATTENTION_BACKEND)
